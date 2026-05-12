@@ -8,9 +8,29 @@ import plotly.graph_objects as go
 import streamlit as st
 import yfinance as yf
 
+
+def check_password():
+    if "authenticated" not in st.session_state:
+        st.session_state.authenticated = False
+    
+    if not st.session_state.authenticated:
+        st.title("Login")
+        password = st.text_input("Password", type="password")
+        if st.button("Login"):
+            if password == "2972":
+                st.session_state.authenticated = True
+                st.rerun()
+            else:
+                st.error("Incorrect password")
+        st.stop()
+
+check_password()
+
+
 PORTFOLIO_FILE = "portfolio.csv"
 RF_ANNUAL = 0.045
 ALPHA_SINCE_DATE = datetime(2026, 2, 1).date()
+
 
 
 # ── Formatters ────────────────────────────────────────────────────────────────
