@@ -12,7 +12,7 @@ import yfinance as yf
 def check_password():
     if "authenticated" not in st.session_state:
         st.session_state.authenticated = False
-    
+
     if not st.session_state.authenticated:
         st.title("Login")
         password = st.text_input("Password", type="password")
@@ -31,6 +31,55 @@ PORTFOLIO_FILE = "portfolio.csv"
 RF_ANNUAL = 0.045
 ALPHA_SINCE_DATE = datetime(2026, 2, 1).date()
 
+# Custom display order for tables and charts
+TICKER_ORDER = ["SPY", "DIA", "VINP", "NU", "BRK-B", "MSA", "DUK"]
+
+# Sector classification (ETFs kept as their own category)
+SECTOR_MAP = {
+    "SPY":   "Broad US Equity (ETF)",
+    "DIA":   "Broad US Equity (ETF)",
+    "VINP":  "Financial Services",
+    "NU":    "Financial Services",
+    "BRK-B": "Financial Services",
+    "MSA":   "Industrials",
+    "DUK":   "Utilities",
+}
+
+# Geography classification
+GEOGRAPHY_MAP = {
+    "SPY":   "United States",
+    "DIA":   "United States",
+    "VINP":  "Brazil",
+    "NU":    "Brazil",
+    "BRK-B": "United States",
+    "MSA":   "United States",
+    "DUK":   "United States",
+}
+
+
+def sort_tickers(tickers):
+    """Sort tickers per TICKER_ORDER, unknown tickers alphabetically at the end."""
+    in_order = [t for t in TICKER_ORDER if t in tickers]
+    others   = sorted([t for t in tickers if t not in TICKER_ORDER])
+    return in_order + others
+
+
+def classify_sector(ticker, info=None):
+    """Return sector for ticker — uses SECTOR_MAP first, falls back to yfinance info."""
+    if ticker in SECTOR_MAP:
+        return SECTOR_MAP[ticker]
+    if info:
+        return info.get("sector") or "Unknown"
+    return "Unknown"
+
+
+def classify_geography(ticker, info=None):
+    """Return geography for ticker — uses GEOGRAPHY_MAP first, falls back to yfinance info."""
+    if ticker in GEOGRAPHY_MAP:
+        return GEOGRAPHY_MAP[ticker]
+    if info:
+        return info.get("country") or "Unknown"
+    return "Unknown"
 
 
 # ── Formatters ────────────────────────────────────────────────────────────────
@@ -69,9 +118,6 @@ def fmt_num(x, d=2):
 def company_label(ticker, info):
     name = info.get("longName") or info.get("shortName") or ticker
     return f"{name} ({ticker})"
-
-def weighted_avg(df, val, wt):
-    return (df[val] * df[wt]).sum() / df[wt].sum()
 
 
 # ── Persistence ───────────────────────────────────────────────────────────────
@@ -148,12 +194,10 @@ def compute_net_positions(portfolio):
 
         net_qty = float(g["quantity"].sum())
 
-        # Average cost from buys only
         total_buy_qty  = float(buys["quantity"].sum()) if not buys.empty else 0.0
         total_buy_cost = float((buys["quantity"] * buys["price_paid"]).sum()) if not buys.empty else 0.0
         avg_cost = total_buy_cost / total_buy_qty if total_buy_qty > 0 else 0.0
 
-        # Realized P&L: for each sell, (sale_price - avg_cost) * shares_sold
         realized_pnl = 0.0
         if not sells.empty:
             for _, sell_row in sells.iterrows():
@@ -291,7 +335,6 @@ with st.sidebar:
         elif current_price(sym) is None:
             st.error(f"Could not find '{sym}'.")
         else:
-            # Load current positions to check sell feasibility
             _current_portfolio = load_portfolio()
             _net_pos = compute_net_positions(_current_portfolio)
             _net_qty_ticker = _net_pos.get(sym, {}).get("net_qty", 0.0)
@@ -319,12 +362,10 @@ if portfolio.empty:
     st.info("No trades yet. Use the sidebar to add your first trade.")
     st.stop()
 
-# Compute net positions and filter to active holdings only
 net_positions = compute_net_positions(portfolio)
-active_tickers = [t for t, v in net_positions.items() if v["net_qty"] > 0]
-
-# All tickers ever traded (for history purposes)
-all_tickers = portfolio["ticker"].unique().tolist()
+# Apply custom ordering
+active_tickers = sort_tickers([t for t, v in net_positions.items() if v["net_qty"] > 0])
+all_tickers    = portfolio["ticker"].unique().tolist()
 
 min_date = portfolio["date"].min().date()
 today    = date.today()
@@ -337,11 +378,9 @@ with st.spinner("Loading market data, please wait..."):
     div_data = {t: get_dividends(t)   for t in active_tickers}
     ff4      = get_ff4_factors(str(min_date))
 
-    # Bulk price history for risk/alpha calculations
     all_needed_tickers = tuple(sorted(set(active_tickers + ["SPY"])))
     bulk_history = get_price_history(all_needed_tickers, str(min_date), end_str)
 
-    # Securities summary: ytd, 5y
     ytd_start     = date(today.year, 1, 1)
     five_yr_start = today - timedelta(days=5 * 365)
 
@@ -351,13 +390,36 @@ with st.spinner("Loading market data, please wait..."):
         hist_ytd[t] = fetch_prices(t, str(ytd_start - timedelta(days=5)), end_str)
         hist_5y[t]  = fetch_prices(t, str(five_yr_start), end_str)
 
-    # SPY for securities tab
     hist_ytd["SPY"] = fetch_prices("SPY", str(ytd_start - timedelta(days=5)), end_str)
     hist_5y["SPY"]  = fetch_prices("SPY", str(five_yr_start), end_str)
 
+# ── Dividends & yield-on-cost helpers ─────────────────────────────────────────
+
+def ttm_dividends_per_share(ticker):
+    """Trailing 12-month dividends per share (sum of dividend payments)."""
+    divs = div_data.get(ticker, pd.Series(dtype=float))
+    if divs.empty:
+        return 0.0
+    cutoff = pd.Timestamp(today - timedelta(days=365))
+    return float(divs[divs.index >= cutoff].sum())
+
+
 # ── Enrich rows (active holdings only) ───────────────────────────────────────
 
-# Build a summary row per active ticker using net positions + avg cost
+# Dividends actually received by Fernando (based on his holding history)
+div_by_ticker = {t: 0.0 for t in active_tickers}
+for t in active_tickers:
+    divs = div_data.get(t, pd.Series(dtype=float))
+    if divs.empty:
+        continue
+    for div_date, dps in divs.items():
+        shares_at_date = float(portfolio[
+            (portfolio["ticker"] == t) &
+            (pd.to_datetime(portfolio["date"]).dt.tz_localize(None) <= div_date)
+        ]["quantity"].sum())
+        if shares_at_date > 0:
+            div_by_ticker[t] += dps * shares_at_date
+
 holding_rows = []
 for ticker in active_tickers:
     pos     = net_positions[ticker]
@@ -369,41 +431,39 @@ for ticker in active_tickers:
     gain_loss = (cur_val - cost_bas) if cur_val is not None else None
     ret_pct   = (gain_loss / cost_bas * 100) if (gain_loss is not None and cost_bas > 0) else None
 
-    # First buy date for this ticker
+    # Dividends received and yield-on-cost
+    divs_received = div_by_ticker.get(ticker, 0.0)
+    ttm_dps       = ttm_dividends_per_share(ticker)
+    yoc_pct       = (ttm_dps / avg_cost * 100) if avg_cost > 0 else None
+    total_pnl     = (gain_loss + divs_received) if gain_loss is not None else None
+    total_ret_pct = (total_pnl / cost_bas * 100) if (total_pnl is not None and cost_bas > 0) else None
+
     ticker_buys = portfolio[(portfolio["ticker"] == ticker) & (portfolio["quantity"] > 0)]
     first_buy_date = ticker_buys["date"].min() if not ticker_buys.empty else portfolio[portfolio["ticker"] == ticker]["date"].min()
     holding_days = (pd.Timestamp(today) - pd.Timestamp(first_buy_date)).days
 
     holding_rows.append({
-        "ticker":        ticker,
-        "company":       company_label(ticker, infos.get(ticker, {})),
-        "net_qty":       net_qty,
-        "avg_cost":      avg_cost,
-        "current_price": cur_price,
-        "cost_basis":    cost_bas,
-        "current_value": cur_val,
-        "gain_loss":     gain_loss,
-        "return_pct":    ret_pct,
-        "holding_days":  holding_days,
-        "realized_pnl":  pos["realized_pnl"],
+        "ticker":          ticker,
+        "company":         company_label(ticker, infos.get(ticker, {})),
+        "net_qty":         net_qty,
+        "avg_cost":        avg_cost,
+        "current_price":   cur_price,
+        "cost_basis":      cost_bas,
+        "current_value":   cur_val,
+        "gain_loss":       gain_loss,
+        "return_pct":      ret_pct,
+        "dividends":       divs_received,
+        "total_pnl":       total_pnl,
+        "total_return_pct": total_ret_pct,
+        "yield_on_cost":   yoc_pct,
+        "ttm_dps":         ttm_dps,
+        "holding_days":    holding_days,
+        "realized_pnl":    pos["realized_pnl"],
+        "sector":          classify_sector(ticker, infos.get(ticker, {})),
+        "geography":       classify_geography(ticker, infos.get(ticker, {})),
     })
 
 holdings_df = pd.DataFrame(holding_rows) if holding_rows else pd.DataFrame()
-
-# Dividends (for active holdings based on net quantity)
-div_by_ticker = {t: 0.0 for t in active_tickers}
-for t in active_tickers:
-    divs = div_data.get(t, pd.Series(dtype=float))
-    if divs.empty:
-        continue
-    # Use net shares held at each dividend date
-    for div_date, dps in divs.items():
-        shares_at_date = float(portfolio[
-            (portfolio["ticker"] == t) &
-            (pd.to_datetime(portfolio["date"]).dt.tz_localize(None) <= div_date)
-        ]["quantity"].sum())  # sum of all quantities (buys + sells) up to that date
-        if shares_at_date > 0:
-            div_by_ticker[t] += dps * shares_at_date
 
 # Realized P&L totals
 total_realized_pnl = sum(net_positions[t]["realized_pnl"] for t in all_tickers)
@@ -416,7 +476,6 @@ port_vals, port_costs = [], []
 for d in date_range:
     pv = pc = 0.0
     active_at_d = portfolio[pd.to_datetime(portfolio["date"]).dt.tz_localize(None) <= d]
-    # Compute net positions as of date d
     net_at_d = {}
     for t, g in active_at_d.groupby("ticker"):
         buys_d  = g[g["quantity"] > 0]
@@ -443,7 +502,6 @@ perf = pd.DataFrame({"date": date_range, "port_val": port_vals, "port_cost": por
 perf = perf[perf["port_cost"] > 0].copy().reset_index(drop=True)
 perf["port_ret"] = (perf["port_val"] - perf["port_cost"]) / perf["port_cost"] * 100
 
-# SPY: simple price return from first purchase date
 spy_hist = history.get("SPY", pd.Series(dtype=float))
 if not spy_hist.empty:
     spy_from = spy_hist[spy_hist.index >= pd.Timestamp(min_date)]
@@ -455,27 +513,26 @@ if not spy_hist.empty:
 else:
     perf["spy_ret"] = 0.0
 
-# Normalize portfolio to 0% on day 1
 if not perf.empty:
     perf["port_ret"] -= perf["port_ret"].iloc[0]
 
 perf["alpha"] = perf["port_ret"] - perf["spy_ret"]
 
-# ── Risk Metrics (fixed) ──────────────────────────────────────────────────────
+# ── Risk Metrics (rebuilt with weighted individual betas + 1Y total return) ──
 
 risk_vals = {}
 dd_series = pd.Series(dtype=float)
-ticker_risk = {}  # per-ticker annual return and vol
+ticker_risk = {}  # per-ticker 1Y total return, vol, beta
 
 if len(perf) >= 5:
     port_daily = perf.set_index("date")["port_val"].pct_change().dropna()
     spy_daily  = spy_hist.pct_change().dropna() if not spy_hist.empty else pd.Series(dtype=float)
     rf_d       = RF_ANNUAL / 252
 
-    # Portfolio annual vol from daily portfolio returns
+    # Portfolio annual volatility from daily portfolio returns
     ann_vol = port_daily.std() * np.sqrt(252) * 100
 
-    # Portfolio annual return: weighted average of individual 1Y returns
+    # Per-ticker 1Y total return (price + TTM dividends), vol, and beta
     hist_1y_start = str(today - timedelta(days=365))
     total_port_val = sum(
         (net_positions[t]["net_qty"] * prices[t])
@@ -483,6 +540,9 @@ if len(perf) >= 5:
     )
 
     weighted_ann_ret = 0.0
+    weighted_beta_num = 0.0
+    weighted_beta_den = 0.0
+
     for t in active_tickers:
         cur_p = prices.get(t)
         if cur_p is None:
@@ -491,32 +551,64 @@ if len(perf) >= 5:
         if h1y.empty:
             continue
         try:
-            t_ann_ret = (float(h1y.iloc[-1]) / float(h1y.iloc[0])) - 1
+            start_p = float(h1y.iloc[0])
+            end_p   = float(h1y.iloc[-1])
+            t_price_ret = (end_p / start_p) - 1
         except Exception:
             continue
-        t_daily = h1y.pct_change().dropna()
+
+        # TTM dividend yield component (use start-of-period price for yield)
+        ttm_dps = ttm_dividends_per_share(t)
+        t_div_yield = (ttm_dps / start_p) if start_p > 0 else 0.0
+        t_total_ret = t_price_ret + t_div_yield
+
+        t_daily   = h1y.pct_change().dropna()
         t_ann_vol = float(t_daily.std() * np.sqrt(252) * 100)
-        ticker_risk[t] = {"ann_ret": t_ann_ret * 100, "ann_vol": t_ann_vol}
+
+        # Individual beta from yfinance (5Y monthly regression vs S&P)
+        t_beta = infos.get(t, {}).get("beta")
+        try:
+            t_beta = float(t_beta) if t_beta is not None else None
+        except (ValueError, TypeError):
+            t_beta = None
+
+        # For ETFs that track the S&P, override to ~1
+        if t == "SPY":
+            t_beta = 1.00
+
+        ticker_risk[t] = {
+            "ann_ret":  t_total_ret * 100,
+            "ann_vol":  t_ann_vol,
+            "beta":     t_beta,
+            "ttm_dps":  ttm_dps,
+        }
 
         weight = (net_positions[t]["net_qty"] * cur_p) / total_port_val if total_port_val > 0 else 0.0
-        weighted_ann_ret += t_ann_ret * weight
+        weighted_ann_ret += t_total_ret * weight
+
+        if t_beta is not None:
+            weighted_beta_num += t_beta * weight
+            weighted_beta_den += weight
 
     ann_ret_pct = weighted_ann_ret * 100
 
-    excess = port_daily - rf_d
-    sharpe = excess.mean() / excess.std() * np.sqrt(252) if excess.std() > 0 else np.nan
+    # Weighted beta — renormalize if any tickers missing beta
+    if weighted_beta_den > 0:
+        weighted_beta = weighted_beta_num / weighted_beta_den
+    else:
+        weighted_beta = np.nan
 
-    common = port_daily.index.intersection(spy_daily.index)
-    beta = (
-        port_daily.loc[common].cov(spy_daily.loc[common]) / spy_daily.loc[common].var()
-        if len(common) > 5 else np.nan
-    )
+    # Sharpe = (annualized return - rf) / annualized vol
+    if ann_vol > 0:
+        sharpe = (ann_ret_pct - RF_ANNUAL * 100) / ann_vol
+    else:
+        sharpe = np.nan
 
     risk_vals = {
         "Ann. Return":     f"{ann_ret_pct:.2f}%",
         "Ann. Volatility": f"{ann_vol:.2f}%",
         "Sharpe Ratio":    f"{sharpe:.2f}",
-        "Beta (vs SPY)":   f"{beta:.2f}",
+        "Beta (weighted)": f"{weighted_beta:.2f}" if not np.isnan(weighted_beta) else "—",
     }
 
     cum      = (1 + port_daily.fillna(0)).cumprod()
@@ -526,14 +618,8 @@ if len(perf) >= 5:
 # ── Alpha Calculations ────────────────────────────────────────────────────────
 
 def compute_alpha_for_period(start_date, net_pos, history_dict, spy_series):
-    """
-    Compute portfolio and SPY cumulative returns from start_date to today.
-    Uses current net positions valued at historical prices.
-    Returns (port_ret, spy_ret, alpha) as floats (in %, e.g. 5.0 = 5%).
-    """
     start_ts = pd.Timestamp(start_date)
 
-    # Portfolio value on start date
     port_val_start = 0.0
     port_val_end   = 0.0
     for t, pos in net_pos.items():
@@ -554,7 +640,6 @@ def compute_alpha_for_period(start_date, net_pos, history_dict, spy_series):
 
     port_ret = (port_val_end / port_val_start - 1) * 100
 
-    # SPY return for same period
     if spy_series.empty:
         return port_ret, None, None
     spy_start_slice = spy_series[spy_series.index <= start_ts]
@@ -599,20 +684,38 @@ with tab_h:
                 "Cost Basis":      fmt_usd(hr["cost_basis"]),
                 "Current Value":   fmt_usd(hr["current_value"]),
                 "Unrealized P&L":  fmt_usd(hr["gain_loss"]),
-                "Return":          fmt_pct_sign(hr["return_pct"]),
+                "Dividends":       fmt_usd(hr["dividends"]),
+                "Total P&L":       fmt_usd(hr["total_pnl"]),
+                "Return (w/ div)": fmt_pct_sign(hr["total_return_pct"]),
+                "Yield on Cost":   fmt_pct(hr["yield_on_cost"]) if hr["yield_on_cost"] is not None else "—",
                 "Avg Hold (days)": int(hr["holding_days"]),
             })
         st.dataframe(pd.DataFrame(grouped_rows), use_container_width=True, hide_index=True)
 
-        tc = holdings_df["cost_basis"].sum()
-        tv = holdings_df["current_value"].sum() if holdings_df["current_value"].notna().any() else 0.0
-        tg = tv - tc
+        tc      = holdings_df["cost_basis"].sum()
+        tv      = holdings_df["current_value"].sum() if holdings_df["current_value"].notna().any() else 0.0
+        tg      = tv - tc
+        tdivs   = holdings_df["dividends"].sum()
+        ttm_div_dollar = float((holdings_df["ttm_dps"] * holdings_df["net_qty"]).sum())
+        port_yoc = (ttm_div_dollar / tc * 100) if tc > 0 else None
+
+        # Row 1: core stats
         c1, c2, c3, c4 = st.columns(4)
         c1.metric("Total Invested",   fmt_usd(tc))
         c2.metric("Portfolio Value",  fmt_usd(tv))
         c3.metric("Unrealized P&L",   fmt_usd(tg))
         c4.metric("Overall Return",   fmt_pct(tg / tc * 100) if tc > 0 else "—",
                   delta=fmt_pct(tg / tc * 100) if tc > 0 else None)
+
+        # Row 2: dividend & total P&L stats
+        d1, d2, d3, d4 = st.columns(4)
+        d1.metric("Total Dividends Received", fmt_usd(tdivs))
+        d2.metric("P&L (incl. Dividends)",    fmt_usd(tg + tdivs))
+        d3.metric("Total Return (w/ div)",
+                  fmt_pct_sign((tg + tdivs) / tc * 100) if tc > 0 else "—")
+        d4.metric("Portfolio Yield on Cost",
+                  fmt_pct(port_yoc) if port_yoc is not None else "—",
+                  help="Trailing 12-month dividends ÷ original cost basis.")
 
         if total_realized_pnl != 0.0:
             st.metric("Realized P&L (all sells)", fmt_usd(total_realized_pnl))
@@ -698,7 +801,6 @@ with tab_p:
             f"S&P 500 shows SPY price return from same date."
         )
 
-        # Individual charts — one per stock, 2-column grid
         st.divider()
         st.subheader("Individual Holdings")
         cols = st.columns(2)
@@ -743,6 +845,8 @@ with tab_a:
             alloc_rows.append({
                 "ticker":        hr["ticker"],
                 "company":       hr["company"],
+                "sector":        hr["sector"],
+                "geography":     hr["geography"],
                 "cost_basis":    cost,
                 "current_value": val,
                 "cost_weight":   cost / total_cost * 100 if total_cost > 0 else 0,
@@ -750,6 +854,8 @@ with tab_a:
             })
         alloc_df = pd.DataFrame(alloc_rows)
 
+        # ─── Per-ticker pies (original) ───────────────────────────────────────
+        st.subheader("By Holding")
         col1, col2 = st.columns(2)
         with col1:
             fig_pie1 = px.pie(alloc_df, values="current_value", names="ticker",
@@ -766,12 +872,90 @@ with tab_a:
         for _, r in alloc_df.iterrows():
             tbl_alloc.append({
                 "Company":       r["company"],
+                "Sector":        r["sector"],
+                "Geography":     r["geography"],
                 "Current Value": fmt_usd(r["current_value"]),
                 "Value Weight":  fmt_pct(r["val_weight"]),
                 "Cost Basis":    fmt_usd(r["cost_basis"]),
                 "Cost Weight":   fmt_pct(r["cost_weight"]),
             })
         st.dataframe(pd.DataFrame(tbl_alloc), use_container_width=True, hide_index=True)
+
+        # ─── By Sector ────────────────────────────────────────────────────────
+        st.divider()
+        st.subheader("By Sector")
+        sector_agg = alloc_df.groupby("sector", as_index=False).agg(
+            current_value=("current_value", "sum"),
+            cost_basis=("cost_basis", "sum"),
+        )
+        sector_agg["val_weight"]  = sector_agg["current_value"] / total_val  * 100 if total_val  > 0 else 0
+        sector_agg["cost_weight"] = sector_agg["cost_basis"]    / total_cost * 100 if total_cost > 0 else 0
+
+        col_s1, col_s2 = st.columns(2)
+        with col_s1:
+            fig_sec1 = px.pie(sector_agg, values="current_value", names="sector",
+                              title="By Current Value")
+            fig_sec1.update_traces(textinfo="label+percent")
+            st.plotly_chart(fig_sec1, use_container_width=True)
+        with col_s2:
+            fig_sec2 = px.bar(sector_agg.sort_values("current_value", ascending=True),
+                              x="current_value", y="sector", orientation="h",
+                              title="Sector Allocation ($)", text="current_value")
+            fig_sec2.update_traces(texttemplate="$%{text:,.0f}", textposition="outside")
+            fig_sec2.update_layout(yaxis_title="", xaxis_title="Current Value ($)",
+                                   xaxis_tickprefix="$", showlegend=False)
+            st.plotly_chart(fig_sec2, use_container_width=True)
+
+        sec_tbl = []
+        for _, r in sector_agg.iterrows():
+            sec_tbl.append({
+                "Sector":        r["sector"],
+                "Current Value": fmt_usd(r["current_value"]),
+                "Value Weight":  fmt_pct(r["val_weight"]),
+                "Cost Basis":    fmt_usd(r["cost_basis"]),
+                "Cost Weight":   fmt_pct(r["cost_weight"]),
+            })
+        st.dataframe(pd.DataFrame(sec_tbl), use_container_width=True, hide_index=True)
+
+        # ─── By Geography ─────────────────────────────────────────────────────
+        st.divider()
+        st.subheader("By Geography")
+        geo_agg = alloc_df.groupby("geography", as_index=False).agg(
+            current_value=("current_value", "sum"),
+            cost_basis=("cost_basis", "sum"),
+        )
+        geo_agg["val_weight"]  = geo_agg["current_value"] / total_val  * 100 if total_val  > 0 else 0
+        geo_agg["cost_weight"] = geo_agg["cost_basis"]    / total_cost * 100 if total_cost > 0 else 0
+
+        col_g1, col_g2 = st.columns(2)
+        with col_g1:
+            fig_geo1 = px.pie(geo_agg, values="current_value", names="geography",
+                              title="By Current Value",
+                              color="geography",
+                              color_discrete_map={"United States": "#1f77b4", "Brazil": "#2ca02c"})
+            fig_geo1.update_traces(textinfo="label+percent")
+            st.plotly_chart(fig_geo1, use_container_width=True)
+        with col_g2:
+            fig_geo2 = px.bar(geo_agg.sort_values("current_value", ascending=True),
+                              x="current_value", y="geography", orientation="h",
+                              title="Geographic Allocation ($)", text="current_value",
+                              color="geography",
+                              color_discrete_map={"United States": "#1f77b4", "Brazil": "#2ca02c"})
+            fig_geo2.update_traces(texttemplate="$%{text:,.0f}", textposition="outside")
+            fig_geo2.update_layout(yaxis_title="", xaxis_title="Current Value ($)",
+                                   xaxis_tickprefix="$", showlegend=False)
+            st.plotly_chart(fig_geo2, use_container_width=True)
+
+        geo_tbl = []
+        for _, r in geo_agg.iterrows():
+            geo_tbl.append({
+                "Geography":     r["geography"],
+                "Current Value": fmt_usd(r["current_value"]),
+                "Value Weight":  fmt_pct(r["val_weight"]),
+                "Cost Basis":    fmt_usd(r["cost_basis"]),
+                "Cost Weight":   fmt_pct(r["cost_weight"]),
+            })
+        st.dataframe(pd.DataFrame(geo_tbl), use_container_width=True, hide_index=True)
 
 # ─── P&L & Dividends ──────────────────────────────────────────────────────────
 
@@ -784,7 +968,7 @@ with tab_pnl:
             ticker = hr["ticker"]
             cost   = hr["cost_basis"]
             unr    = hr["gain_loss"] if pd.notna(hr["gain_loss"]) else 0.0
-            divs   = div_by_ticker.get(ticker, 0.0)
+            divs   = hr["dividends"]
             pnl_rows.append({
                 "Company":        hr["company"],
                 "Shares":         fmt_num(hr["net_qty"]),
@@ -794,10 +978,11 @@ with tab_pnl:
                 "Dividends":      fmt_usd(divs),
                 "Total P&L":      fmt_usd(unr + divs),
                 "Total Return":   fmt_pct_sign((unr + divs) / cost * 100) if cost > 0 else "—",
+                "Yield on Cost":  fmt_pct(hr["yield_on_cost"]) if hr["yield_on_cost"] is not None else "—",
             })
         st.dataframe(pd.DataFrame(pnl_rows), use_container_width=True, hide_index=True)
 
-        tu       = sum(div_by_ticker.values())
+        tu       = holdings_df["dividends"].sum()
         tv_pnl   = holdings_df["current_value"].sum()
         tc_pnl   = holdings_df["cost_basis"].sum()
         c1, c2, c3, c4 = st.columns(4)
@@ -806,6 +991,7 @@ with tab_pnl:
         c3.metric("Total Dividends", fmt_usd(tu))
         c4.metric("Total P&L",       fmt_usd(tv_pnl - tc_pnl + total_realized_pnl + tu))
 
+    # Build dividend events list (one event per pay date per ticker)
     all_div_events = []
     for t in active_tickers:
         divs = div_data.get(t, pd.Series(dtype=float))
@@ -820,17 +1006,43 @@ with tab_pnl:
                 all_div_events.append({"date": div_date, "ticker": t, "amount": dps * sh})
 
     if all_div_events:
-        st.subheader("Dividend Payments Received")
+        st.subheader("Cumulative Dividends Received by Stock")
         div_df = pd.DataFrame(all_div_events).sort_values("date")
-        fig_div = go.Figure()
-        for t in div_df["ticker"].unique():
-            sub = div_df[div_df["ticker"] == t]
-            fig_div.add_trace(go.Bar(x=sub["date"], y=sub["amount"],
-                                     name=company_label(t, infos.get(t, {}))))
-        fig_div.update_layout(barmode="stack", xaxis_title="Date", yaxis_title="Amount ($)",
-                              yaxis_tickprefix="$", height=320,
-                              legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1))
-        st.plotly_chart(fig_div, use_container_width=True)
+
+        # Pivot to wide: rows = dates, cols = tickers, values = $ received
+        div_pivot = div_df.pivot_table(
+            index="date", columns="ticker", values="amount", aggfunc="sum"
+        ).fillna(0).sort_index()
+
+        # Cumulative sum so the line/area only ever climbs
+        div_cumul = div_pivot.cumsum()
+
+        # Order columns per TICKER_ORDER
+        ordered_cols = [c for c in sort_tickers(list(div_cumul.columns)) if c in div_cumul.columns]
+        div_cumul = div_cumul[ordered_cols]
+
+        fig_cum = go.Figure()
+        for t in ordered_cols:
+            fig_cum.add_trace(go.Scatter(
+                x=div_cumul.index,
+                y=div_cumul[t],
+                name=company_label(t, infos.get(t, {})),
+                mode="lines",
+                stackgroup="one",
+                line=dict(width=0.5),
+                hovertemplate="%{x|%Y-%m-%d}<br>$%{y:,.2f}<extra>%{fullData.name}</extra>",
+            ))
+        fig_cum.update_layout(
+            xaxis_title="Date",
+            yaxis_title="Cumulative Dividends ($)",
+            yaxis_tickprefix="$",
+            yaxis_tickformat=",.2f",
+            height=420,
+            hovermode="x unified",
+            legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1),
+        )
+        st.plotly_chart(fig_cum, use_container_width=True)
+        st.caption("Each stock's contribution stacks on top — total height at any date = total dividends received to that point.")
     else:
         st.info("No dividend payments found since your purchase dates.")
 
@@ -842,25 +1054,31 @@ with tab_r:
     else:
         st.subheader("Portfolio Risk Metrics")
         c1, c2, c3, c4 = st.columns(4)
-        c1.metric("Ann. Return",     risk_vals["Ann. Return"])
-        c2.metric("Ann. Volatility", risk_vals["Ann. Volatility"])
-        c3.metric("Sharpe Ratio",    risk_vals["Sharpe Ratio"])
-        c4.metric("Beta (vs SPY)",   risk_vals["Beta (vs SPY)"])
+        c1.metric("Ann. Return",      risk_vals["Ann. Return"])
+        c2.metric("Ann. Volatility",  risk_vals["Ann. Volatility"])
+        c3.metric("Sharpe Ratio",     risk_vals["Sharpe Ratio"])
+        c4.metric("Beta (weighted)",  risk_vals["Beta (weighted)"])
         st.caption(
             f"Assumed risk-free rate: {RF_ANNUAL*100:.1f}% p.a. | "
-            "Ann. Return = value-weighted average of individual 1Y returns. "
-            "Ann. Volatility = portfolio-level daily returns * sqrt(252)."
+            "Ann. Return = value-weighted 1Y total return (price + TTM dividends) per holding. "
+            "Ann. Volatility = stdev of portfolio daily returns × √252. "
+            "Sharpe = (Ann. Return − Rf) ÷ Ann. Volatility. "
+            "Beta = value-weighted average of each holding's 5Y beta (from yfinance, sourced from S&P regression)."
         )
 
-        # Per-ticker risk breakdown
+        # Per-ticker risk breakdown — now includes individual beta
         if ticker_risk:
             st.subheader("Per-Ticker Risk (1Y)")
             tk_risk_rows = []
-            for t, rv in ticker_risk.items():
+            for t in active_tickers:
+                if t not in ticker_risk:
+                    continue
+                rv = ticker_risk[t]
                 tk_risk_rows.append({
                     "Company":         company_label(t, infos.get(t, {})),
-                    "1Y Ann. Return":  fmt_pct_sign(rv["ann_ret"]),
+                    "1Y Total Return": fmt_pct_sign(rv["ann_ret"]),
                     "1Y Ann. Vol":     fmt_pct(rv["ann_vol"]),
+                    "Beta (5Y)":       fmt_num(rv["beta"]) if rv["beta"] is not None else "—",
                 })
             st.dataframe(pd.DataFrame(tk_risk_rows), use_container_width=True, hide_index=True)
 
@@ -874,7 +1092,6 @@ with tab_r:
                              height=280, yaxis_ticksuffix="%")
         st.plotly_chart(fig_dd, use_container_width=True)
 
-        # FF4 — only show if data loaded successfully
         if not ff4.empty:
             st.subheader("Fama-French 4-Factor Exposures")
             st.caption("OLS regression on Market, SMB, HML, UMD. Requires >= 30 trading days per security.")
@@ -902,7 +1119,6 @@ with tab_r:
 with tab_sec:
     st.subheader("Securities Overview")
 
-    # SPY benchmark row at top
     spy_info = get_ticker_info("SPY")
     h_ytd_spy = hist_ytd.get("SPY", pd.Series(dtype=float))
     spy_ytd_ret = None
@@ -931,7 +1147,6 @@ with tab_sec:
         sentences = [s.strip() for s in desc.split(". ") if s.strip()]
         short_desc = ". ".join(sentences[:2]) + ("." if len(sentences) >= 2 else "")
 
-        # YTD return using actual first trading day of the year
         h_ytd = hist_ytd.get(ticker, pd.Series(dtype=float))
         ytd_ret = None
         if not h_ytd.empty:
@@ -939,7 +1154,6 @@ with tab_sec:
             if not ytd_slice.empty:
                 ytd_ret = (float(h_ytd.iloc[-1]) / float(ytd_slice.iloc[0]) - 1) * 100
 
-        # 5Y return
         h_5y = hist_5y.get(ticker, pd.Series(dtype=float))
         five_yr_ret = None
         if not h_5y.empty and len(h_5y) > 10:
@@ -1006,7 +1220,6 @@ with tab_alpha:
     alpha_df = pd.DataFrame(alpha_data)
     st.dataframe(alpha_df, use_container_width=True, hide_index=True)
 
-    # Metric cards with color context
     col1, col2 = st.columns(2)
     with col1:
         st.subheader("Since Inception")
@@ -1030,7 +1243,6 @@ with tab_alpha:
         else:
             st.warning("Not enough history to compute alpha since Feb 1, 2026.")
 
-    # Chart: rolling alpha over time
     if not perf.empty:
         st.divider()
         st.subheader("Alpha Over Time (vs. Since Inception)")
