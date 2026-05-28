@@ -32,28 +32,43 @@ RF_ANNUAL = 0.045
 ALPHA_SINCE_DATE = datetime(2026, 2, 1).date()
 
 # Custom display order for tables and charts
-TICKER_ORDER = ["SPY", "DIA", "VINP", "NU", "BRK-B", "MSA", "DUK"]
+TICKER_ORDER = ["VOO", "DIA", "VINP", "NU", "BRK-B", "MSA", "DUK"]
 
-# Sector classification (ETFs kept as their own category)
+# Sector classification
 SECTOR_MAP = {
-    "SPY":   "Broad US Equity (ETF)",
+    "VOO":   "Broad US Equity (ETF)",
     "DIA":   "Broad US Equity (ETF)",
+    "SPY":   "Broad US Equity (ETF)",
     "VINP":  "Financial Services",
     "NU":    "Financial Services",
-    "BRK-B": "Financial Services",
+    "BRK-B": "Diversified Equity (US)",
     "MSA":   "Industrials",
     "DUK":   "Utilities",
 }
 
 # Geography classification
 GEOGRAPHY_MAP = {
-    "SPY":   "United States",
+    "VOO":   "United States",
     "DIA":   "United States",
+    "SPY":   "United States",
     "VINP":  "Brazil",
     "NU":    "Brazil",
     "BRK-B": "United States",
     "MSA":   "United States",
     "DUK":   "United States",
+}
+
+# Manually sourced 5Y betas (yfinance returns None for several of these holdings)
+# Sources: stockanalysis.com, macroaxis.com (May 2026)
+MANUAL_BETAS = {
+    "VOO":   1.00,
+    "DIA":   0.95,
+    "SPY":   1.00,
+    "VINP":  0.09,
+    "NU":    1.01,
+    "BRK-B": 0.62,
+    "MSA":   1.01,
+    "DUK":   0.40,
 }
 
 
@@ -65,7 +80,6 @@ def sort_tickers(tickers):
 
 
 def classify_sector(ticker, info=None):
-    """Return sector for ticker — uses SECTOR_MAP first, falls back to yfinance info."""
     if ticker in SECTOR_MAP:
         return SECTOR_MAP[ticker]
     if info:
@@ -74,12 +88,15 @@ def classify_sector(ticker, info=None):
 
 
 def classify_geography(ticker, info=None):
-    """Return geography for ticker — uses GEOGRAPHY_MAP first, falls back to yfinance info."""
     if ticker in GEOGRAPHY_MAP:
         return GEOGRAPHY_MAP[ticker]
     if info:
         return info.get("country") or "Unknown"
     return "Unknown"
+
+
+def get_manual_beta(ticker):
+    return MANUAL_BETAS.get(ticker)
 
 
 # ── Formatters ────────────────────────────────────────────────────────────────
@@ -153,7 +170,6 @@ def load_portfolio():
 
 
 def add_trade(ticker, trade_date, quantity, price_paid):
-    """quantity can be negative for sells."""
     client = _sb()
     if client:
         client.table("trades").insert({
@@ -182,11 +198,6 @@ def delete_trade(row_id):
 
 
 def compute_net_positions(portfolio):
-    """
-    Compute per-ticker net quantity, avg cost (buys only), realized P&L.
-    Returns a dict keyed by ticker with keys: net_qty, avg_cost, realized_pnl.
-    Only tickers with net_qty > 0 are active holdings.
-    """
     result = {}
     for ticker, g in portfolio.groupby("ticker"):
         buys  = g[g["quantity"] > 0]
@@ -233,7 +244,6 @@ def fetch_prices(ticker, start, end):
 
 @st.cache_data(ttl=0)
 def get_price_history(tickers: tuple, start: str, end: str) -> pd.DataFrame:
-    """Download multiple tickers at once and return a DataFrame of Close prices."""
     try:
         data = yf.download(list(tickers), start=start, end=end, auto_adjust=True,
                            progress=False)["Close"]
@@ -270,43 +280,18 @@ def get_dividends(ticker):
         return pd.Series(dtype=float)
 
 
-@st.cache_data(ttl=3600)
-def get_ff4_factors(start):
+def period_return(history_series, period_days):
+    """Total price return over the last `period_days`. Returns % (e.g. 12.5 = +12.5%)."""
+    if history_series is None or history_series.empty:
+        return None
+    start_ts = pd.Timestamp(date.today() - timedelta(days=period_days))
+    slice_ = history_series[history_series.index >= start_ts]
+    if slice_.empty or len(slice_) < 2:
+        return None
     try:
-        import pandas_datareader.data as web
-        f3  = web.DataReader("F-F_Research_Data_Factors_daily", "famafrench", start=start)[0] / 100
-        mom = web.DataReader("F-F_Momentum_Factor_daily",       "famafrench", start=start)[0] / 100
-        ff4 = f3.join(mom[["Mom"]])
-        ff4.index = pd.to_datetime(ff4.index)
-        if ff4.index.tz is not None:
-            ff4.index = ff4.index.tz_localize(None)
-        return ff4
+        return (float(slice_.iloc[-1]) / float(slice_.iloc[0]) - 1) * 100
     except Exception:
-        return pd.DataFrame()
-
-
-def run_ff4(returns, ff4):
-    if ff4.empty:
-        return {}
-    common = returns.index.intersection(ff4.index)
-    if len(common) < 30:
-        return {}
-    y  = (returns.loc[common] - ff4.loc[common, "RF"]).values
-    Xd = ff4.loc[common, ["Mkt-RF", "SMB", "HML", "Mom"]].values
-    Xc = np.column_stack([np.ones(len(Xd)), Xd])
-    coef, _, _, _ = np.linalg.lstsq(Xc, y, rcond=None)
-    y_hat  = Xc @ coef
-    ss_res = np.sum((y - y_hat) ** 2)
-    ss_tot = np.sum((y - y.mean()) ** 2)
-    r2 = 1 - ss_res / ss_tot if ss_tot > 0 else np.nan
-    return {
-        "Alpha (ann. %)": round(coef[0] * 252 * 100, 2),
-        "Beta (Market)":  round(coef[1], 3),
-        "SMB":            round(coef[2], 3),
-        "HML":            round(coef[3], 3),
-        "UMD":            round(coef[4], 3),
-        "R²":             round(r2, 3),
-    }
+        return None
 
 
 # ── App ───────────────────────────────────────────────────────────────────────
@@ -363,40 +348,31 @@ if portfolio.empty:
     st.stop()
 
 net_positions = compute_net_positions(portfolio)
-# Apply custom ordering
 active_tickers = sort_tickers([t for t, v in net_positions.items() if v["net_qty"] > 0])
 all_tickers    = portfolio["ticker"].unique().tolist()
 
 min_date = portfolio["date"].min().date()
 today    = date.today()
 end_str  = str(today + timedelta(days=1))
+five_yr_start = today - timedelta(days=5 * 365)
 
 with st.spinner("Loading market data, please wait..."):
     prices   = {t: current_price(t)  for t in active_tickers}
     infos    = {t: get_ticker_info(t) for t in active_tickers}
     history  = {t: fetch_prices(t, str(min_date), end_str) for t in all_tickers + ["SPY"]}
     div_data = {t: get_dividends(t)   for t in active_tickers}
-    ff4      = get_ff4_factors(str(min_date))
 
     all_needed_tickers = tuple(sorted(set(active_tickers + ["SPY"])))
     bulk_history = get_price_history(all_needed_tickers, str(min_date), end_str)
 
-    ytd_start     = date(today.year, 1, 1)
-    five_yr_start = today - timedelta(days=5 * 365)
-
-    hist_ytd = {}
+    # 5Y price history for each holding (used for 1Y and 5Y return calculations)
     hist_5y  = {}
     for t in active_tickers:
-        hist_ytd[t] = fetch_prices(t, str(ytd_start - timedelta(days=5)), end_str)
         hist_5y[t]  = fetch_prices(t, str(five_yr_start), end_str)
-
-    hist_ytd["SPY"] = fetch_prices("SPY", str(ytd_start - timedelta(days=5)), end_str)
-    hist_5y["SPY"]  = fetch_prices("SPY", str(five_yr_start), end_str)
 
 # ── Dividends & yield-on-cost helpers ─────────────────────────────────────────
 
 def ttm_dividends_per_share(ticker):
-    """Trailing 12-month dividends per share (sum of dividend payments)."""
     divs = div_data.get(ticker, pd.Series(dtype=float))
     if divs.empty:
         return 0.0
@@ -406,7 +382,6 @@ def ttm_dividends_per_share(ticker):
 
 # ── Enrich rows (active holdings only) ───────────────────────────────────────
 
-# Dividends actually received by Fernando (based on his holding history)
 div_by_ticker = {t: 0.0 for t in active_tickers}
 for t in active_tickers:
     divs = div_data.get(t, pd.Series(dtype=float))
@@ -431,12 +406,23 @@ for ticker in active_tickers:
     gain_loss = (cur_val - cost_bas) if cur_val is not None else None
     ret_pct   = (gain_loss / cost_bas * 100) if (gain_loss is not None and cost_bas > 0) else None
 
-    # Dividends received and yield-on-cost
     divs_received = div_by_ticker.get(ticker, 0.0)
     ttm_dps       = ttm_dividends_per_share(ticker)
     yoc_pct       = (ttm_dps / avg_cost * 100) if avg_cost > 0 else None
     total_pnl     = (gain_loss + divs_received) if gain_loss is not None else None
     total_ret_pct = (total_pnl / cost_bas * 100) if (total_pnl is not None and cost_bas > 0) else None
+
+    # Per-ticker 1Y and 5Y returns from yfinance price history
+    h5 = hist_5y.get(ticker, pd.Series(dtype=float))
+    ret_1y = period_return(h5, 365)
+    ret_5y = None
+    if not h5.empty and len(h5) > 10:
+        try:
+            ret_5y = (float(h5.iloc[-1]) / float(h5.iloc[0]) - 1) * 100
+        except Exception:
+            ret_5y = None
+
+    beta = get_manual_beta(ticker)
 
     ticker_buys = portfolio[(portfolio["ticker"] == ticker) & (portfolio["quantity"] > 0)]
     first_buy_date = ticker_buys["date"].min() if not ticker_buys.empty else portfolio[portfolio["ticker"] == ticker]["date"].min()
@@ -461,6 +447,9 @@ for ticker in active_tickers:
         "realized_pnl":    pos["realized_pnl"],
         "sector":          classify_sector(ticker, infos.get(ticker, {})),
         "geography":       classify_geography(ticker, infos.get(ticker, {})),
+        "beta":            beta,
+        "ret_1y":          ret_1y,
+        "ret_5y":          ret_5y,
     })
 
 holdings_df = pd.DataFrame(holding_rows) if holding_rows else pd.DataFrame()
@@ -518,102 +507,45 @@ if not perf.empty:
 
 perf["alpha"] = perf["port_ret"] - perf["spy_ret"]
 
-# ── Risk Metrics (rebuilt with weighted individual betas + 1Y total return) ──
-
-risk_vals = {}
+# Drawdown series (used in Performance tab)
 dd_series = pd.Series(dtype=float)
-ticker_risk = {}  # per-ticker 1Y total return, vol, beta
-
 if len(perf) >= 5:
     port_daily = perf.set_index("date")["port_val"].pct_change().dropna()
-    spy_daily  = spy_hist.pct_change().dropna() if not spy_hist.empty else pd.Series(dtype=float)
-    rf_d       = RF_ANNUAL / 252
-
-    # Portfolio annual volatility from daily portfolio returns
-    ann_vol = port_daily.std() * np.sqrt(252) * 100
-
-    # Per-ticker 1Y total return (price + TTM dividends), vol, and beta
-    hist_1y_start = str(today - timedelta(days=365))
-    total_port_val = sum(
-        (net_positions[t]["net_qty"] * prices[t])
-        for t in active_tickers if prices.get(t) is not None
-    )
-
-    weighted_ann_ret = 0.0
-    weighted_beta_num = 0.0
-    weighted_beta_den = 0.0
-
-    for t in active_tickers:
-        cur_p = prices.get(t)
-        if cur_p is None:
-            continue
-        h1y = fetch_prices(t, hist_1y_start, end_str)
-        if h1y.empty:
-            continue
-        try:
-            start_p = float(h1y.iloc[0])
-            end_p   = float(h1y.iloc[-1])
-            t_price_ret = (end_p / start_p) - 1
-        except Exception:
-            continue
-
-        # TTM dividend yield component (use start-of-period price for yield)
-        ttm_dps = ttm_dividends_per_share(t)
-        t_div_yield = (ttm_dps / start_p) if start_p > 0 else 0.0
-        t_total_ret = t_price_ret + t_div_yield
-
-        t_daily   = h1y.pct_change().dropna()
-        t_ann_vol = float(t_daily.std() * np.sqrt(252) * 100)
-
-        # Individual beta from yfinance (5Y monthly regression vs S&P)
-        t_beta = infos.get(t, {}).get("beta")
-        try:
-            t_beta = float(t_beta) if t_beta is not None else None
-        except (ValueError, TypeError):
-            t_beta = None
-
-        # For ETFs that track the S&P, override to ~1
-        if t == "SPY":
-            t_beta = 1.00
-
-        ticker_risk[t] = {
-            "ann_ret":  t_total_ret * 100,
-            "ann_vol":  t_ann_vol,
-            "beta":     t_beta,
-            "ttm_dps":  ttm_dps,
-        }
-
-        weight = (net_positions[t]["net_qty"] * cur_p) / total_port_val if total_port_val > 0 else 0.0
-        weighted_ann_ret += t_total_ret * weight
-
-        if t_beta is not None:
-            weighted_beta_num += t_beta * weight
-            weighted_beta_den += weight
-
-    ann_ret_pct = weighted_ann_ret * 100
-
-    # Weighted beta — renormalize if any tickers missing beta
-    if weighted_beta_den > 0:
-        weighted_beta = weighted_beta_num / weighted_beta_den
-    else:
-        weighted_beta = np.nan
-
-    # Sharpe = (annualized return - rf) / annualized vol
-    if ann_vol > 0:
-        sharpe = (ann_ret_pct - RF_ANNUAL * 100) / ann_vol
-    else:
-        sharpe = np.nan
-
-    risk_vals = {
-        "Ann. Return":     f"{ann_ret_pct:.2f}%",
-        "Ann. Volatility": f"{ann_vol:.2f}%",
-        "Sharpe Ratio":    f"{sharpe:.2f}",
-        "Beta (weighted)": f"{weighted_beta:.2f}" if not np.isnan(weighted_beta) else "—",
-    }
-
     cum      = (1 + port_daily.fillna(0)).cumprod()
     roll_max = cum.expanding().max()
     dd_series = (cum - roll_max) / roll_max * 100
+
+# ── Portfolio-level weighted metrics for Holdings tab ─────────────────────────
+
+total_port_val = holdings_df["current_value"].sum() if holdings_df["current_value"].notna().any() else 0.0
+
+# Weighted beta (only over holdings with a beta value, renormalized)
+beta_num = 0.0
+beta_den = 0.0
+# Weighted 1Y return
+ret1y_num = 0.0
+ret1y_den = 0.0
+# Weighted 5Y return
+ret5y_num = 0.0
+ret5y_den = 0.0
+
+for _, hr in holdings_df.iterrows():
+    if total_port_val <= 0 or pd.isna(hr["current_value"]):
+        continue
+    weight = hr["current_value"] / total_port_val
+    if hr["beta"] is not None:
+        beta_num += hr["beta"] * weight
+        beta_den += weight
+    if hr["ret_1y"] is not None:
+        ret1y_num += hr["ret_1y"] * weight
+        ret1y_den += weight
+    if hr["ret_5y"] is not None:
+        ret5y_num += hr["ret_5y"] * weight
+        ret5y_den += weight
+
+portfolio_beta  = (beta_num  / beta_den)  if beta_den  > 0 else None
+portfolio_1y    = (ret1y_num / ret1y_den) if ret1y_den > 0 else None
+portfolio_5y    = (ret5y_num / ret5y_den) if ret5y_den > 0 else None
 
 # ── Alpha Calculations ────────────────────────────────────────────────────────
 
@@ -663,9 +595,9 @@ alpha_feb_port, alpha_feb_spy, alpha_feb = compute_alpha_for_period(
 
 # ── Tabs ──────────────────────────────────────────────────────────────────────
 
-tab_h, tab_p, tab_a, tab_pnl, tab_r, tab_sec, tab_nw, tab_alpha = st.tabs([
+tab_h, tab_p, tab_a, tab_pnl, tab_nw, tab_alpha = st.tabs([
     "Holdings", "Performance", "Allocation",
-    "P&L & Dividends", "Risk & Factors", "Securities", "Net Worth", "Alpha",
+    "P&L & Dividends", "Net Worth", "Alpha",
 ])
 
 # ─── Holdings ────────────────────────────────────────────────────────────────
@@ -719,6 +651,36 @@ with tab_h:
 
         if total_realized_pnl != 0.0:
             st.metric("Realized P&L (all sells)", fmt_usd(total_realized_pnl))
+
+        # ─── Performance & Risk by holding ────────────────────────────────────
+        st.divider()
+        st.subheader("Performance & Risk by Holding")
+
+        risk_rows = []
+        for _, hr in holdings_df.iterrows():
+            risk_rows.append({
+                "Company":     hr["company"],
+                "Weight":      fmt_pct((hr["current_value"] / total_port_val * 100)
+                                       if total_port_val > 0 and pd.notna(hr["current_value"])
+                                       else None),
+                "Beta (5Y)":   fmt_num(hr["beta"]) if hr["beta"] is not None else "—",
+                "1Y Return":   fmt_pct_sign(hr["ret_1y"]),
+                "5Y Return":   fmt_pct_sign(hr["ret_5y"]),
+            })
+        st.dataframe(pd.DataFrame(risk_rows), use_container_width=True, hide_index=True)
+
+        # Whole-portfolio summary
+        st.markdown("**Whole Portfolio (weighted by current value)**")
+        p1, p2, p3 = st.columns(3)
+        p1.metric("Overall Beta",
+                  fmt_num(portfolio_beta) if portfolio_beta is not None else "—",
+                  help="Weighted average of each holding's 5Y beta, by current value.")
+        p2.metric("Weighted 1Y Return", fmt_pct_sign(portfolio_1y))
+        p3.metric("Weighted 5Y Return", fmt_pct_sign(portfolio_5y))
+        st.caption(
+            "Betas are 5Y monthly figures sourced from stockanalysis.com / macroaxis.com (May 2026). "
+            "1Y and 5Y returns are price returns from yfinance."
+        )
 
     with st.expander("View / delete individual trades"):
         ind_rows = []
@@ -814,20 +776,34 @@ with tab_p:
             if hist_from.empty:
                 continue
             base    = float(hist_from.iloc[0])
-            ret_pct = (hist_from / base - 1) * 100
+            ret_pct_series = (hist_from / base - 1) * 100
             label   = company_label(t, infos.get(t, {}))
             fig_s = go.Figure()
-            fig_s.add_trace(go.Scatter(x=ret_pct.index, y=ret_pct.values,
+            fig_s.add_trace(go.Scatter(x=ret_pct_series.index, y=ret_pct_series.values,
                                        mode="lines", line=dict(width=2),
                                        fill="tozeroy",
-                                       fillcolor="rgba(31,119,180,0.1)" if ret_pct.iloc[-1] >= 0 else "rgba(214,39,40,0.1)",
-                                       line_color="#1f77b4" if ret_pct.iloc[-1] >= 0 else "#d62728"))
+                                       fillcolor="rgba(31,119,180,0.1)" if ret_pct_series.iloc[-1] >= 0 else "rgba(214,39,40,0.1)",
+                                       line_color="#1f77b4" if ret_pct_series.iloc[-1] >= 0 else "#d62728"))
             fig_s.add_hline(y=0, line_color="gray", line_dash="dash", opacity=0.4)
             fig_s.update_layout(title=label, xaxis_title="", yaxis_title="Return (%)",
                                  height=280, margin=dict(t=40, b=20),
                                  showlegend=False)
             with cols[i % 2]:
                 st.plotly_chart(fig_s, use_container_width=True)
+
+        # Drawdown chart moved to bottom of Performance tab
+        if not dd_series.empty:
+            st.divider()
+            st.subheader("Drawdown from Peak")
+            fig_dd = go.Figure()
+            fig_dd.add_trace(go.Scatter(
+                x=perf["date"].iloc[1:], y=dd_series.values,
+                fill="tozeroy", line=dict(color="#d62728", width=1.5), name="Drawdown",
+            ))
+            fig_dd.update_layout(xaxis_title="Date", yaxis_title="Drawdown (%)",
+                                 height=320, yaxis_ticksuffix="%")
+            st.plotly_chart(fig_dd, use_container_width=True)
+            st.caption("Peak-to-trough decline of total portfolio value over time.")
 
 # ─── Allocation ───────────────────────────────────────────────────────────────
 
@@ -854,7 +830,7 @@ with tab_a:
             })
         alloc_df = pd.DataFrame(alloc_rows)
 
-        # ─── Per-ticker pies (original) ───────────────────────────────────────
+        # ─── Per-ticker pies ──────────────────────────────────────────────────
         st.subheader("By Holding")
         col1, col2 = st.columns(2)
         with col1:
@@ -991,7 +967,7 @@ with tab_pnl:
         c3.metric("Total Dividends", fmt_usd(tu))
         c4.metric("Total P&L",       fmt_usd(tv_pnl - tc_pnl + total_realized_pnl + tu))
 
-    # Build dividend events list (one event per pay date per ticker)
+    # Build dividend events list
     all_div_events = []
     for t in active_tickers:
         divs = div_data.get(t, pd.Series(dtype=float))
@@ -1008,16 +984,10 @@ with tab_pnl:
     if all_div_events:
         st.subheader("Cumulative Dividends Received by Stock")
         div_df = pd.DataFrame(all_div_events).sort_values("date")
-
-        # Pivot to wide: rows = dates, cols = tickers, values = $ received
         div_pivot = div_df.pivot_table(
             index="date", columns="ticker", values="amount", aggfunc="sum"
         ).fillna(0).sort_index()
-
-        # Cumulative sum so the line/area only ever climbs
         div_cumul = div_pivot.cumsum()
-
-        # Order columns per TICKER_ORDER
         ordered_cols = [c for c in sort_tickers(list(div_cumul.columns)) if c in div_cumul.columns]
         div_cumul = div_cumul[ordered_cols]
 
@@ -1045,134 +1015,6 @@ with tab_pnl:
         st.caption("Each stock's contribution stacks on top — total height at any date = total dividends received to that point.")
     else:
         st.info("No dividend payments found since your purchase dates.")
-
-# ─── Risk & Factors ───────────────────────────────────────────────────────────
-
-with tab_r:
-    if not risk_vals:
-        st.warning("Need more price history to compute risk metrics.")
-    else:
-        st.subheader("Portfolio Risk Metrics")
-        c1, c2, c3, c4 = st.columns(4)
-        c1.metric("Ann. Return",      risk_vals["Ann. Return"])
-        c2.metric("Ann. Volatility",  risk_vals["Ann. Volatility"])
-        c3.metric("Sharpe Ratio",     risk_vals["Sharpe Ratio"])
-        c4.metric("Beta (weighted)",  risk_vals["Beta (weighted)"])
-        st.caption(
-            f"Assumed risk-free rate: {RF_ANNUAL*100:.1f}% p.a. | "
-            "Ann. Return = value-weighted 1Y total return (price + TTM dividends) per holding. "
-            "Ann. Volatility = stdev of portfolio daily returns × √252. "
-            "Sharpe = (Ann. Return − Rf) ÷ Ann. Volatility. "
-            "Beta = value-weighted average of each holding's 5Y beta (from yfinance, sourced from S&P regression)."
-        )
-
-        # Per-ticker risk breakdown — now includes individual beta
-        if ticker_risk:
-            st.subheader("Per-Ticker Risk (1Y)")
-            tk_risk_rows = []
-            for t in active_tickers:
-                if t not in ticker_risk:
-                    continue
-                rv = ticker_risk[t]
-                tk_risk_rows.append({
-                    "Company":         company_label(t, infos.get(t, {})),
-                    "1Y Total Return": fmt_pct_sign(rv["ann_ret"]),
-                    "1Y Ann. Vol":     fmt_pct(rv["ann_vol"]),
-                    "Beta (5Y)":       fmt_num(rv["beta"]) if rv["beta"] is not None else "—",
-                })
-            st.dataframe(pd.DataFrame(tk_risk_rows), use_container_width=True, hide_index=True)
-
-        st.subheader("Drawdown from Peak")
-        fig_dd = go.Figure()
-        fig_dd.add_trace(go.Scatter(
-            x=perf["date"].iloc[1:], y=dd_series.values,
-            fill="tozeroy", line=dict(color="#d62728", width=1.5), name="Drawdown",
-        ))
-        fig_dd.update_layout(xaxis_title="Date", yaxis_title="Drawdown (%)",
-                             height=280, yaxis_ticksuffix="%")
-        st.plotly_chart(fig_dd, use_container_width=True)
-
-        if not ff4.empty:
-            st.subheader("Fama-French 4-Factor Exposures")
-            st.caption("OLS regression on Market, SMB, HML, UMD. Requires >= 30 trading days per security.")
-            ff4_rows = []
-            for t in active_tickers:
-                h = history.get(t)
-                if h is None or h.empty:
-                    continue
-                result = run_ff4(h.pct_change().dropna(), ff4)
-                if result:
-                    ff4_rows.append({"Company": company_label(t, infos.get(t, {})), **result})
-            port_daily_ff4 = perf.set_index("date")["port_val"].pct_change().dropna()
-            port_result    = run_ff4(port_daily_ff4, ff4)
-            if port_result:
-                ff4_rows.append({"Company": "PORTFOLIO (combined)", **port_result})
-            if ff4_rows:
-                st.dataframe(pd.DataFrame(ff4_rows), use_container_width=True, hide_index=True)
-                st.caption(
-                    "**Beta > 1**: amplifies market moves. **SMB > 0**: small-cap tilt. "
-                    "**HML > 0**: value tilt. **UMD > 0**: momentum tilt."
-                )
-
-# ─── Securities Summary ───────────────────────────────────────────────────────
-
-with tab_sec:
-    st.subheader("Securities Overview")
-
-    spy_info = get_ticker_info("SPY")
-    h_ytd_spy = hist_ytd.get("SPY", pd.Series(dtype=float))
-    spy_ytd_ret = None
-    if not h_ytd_spy.empty:
-        spy_ytd_slice = h_ytd_spy[h_ytd_spy.index >= pd.Timestamp(ytd_start)]
-        if not spy_ytd_slice.empty:
-            spy_ytd_ret = (float(h_ytd_spy.iloc[-1]) / float(spy_ytd_slice.iloc[0]) - 1) * 100
-
-    h_5y_spy = hist_5y.get("SPY", pd.Series(dtype=float))
-    spy_5y_ret = None
-    if not h_5y_spy.empty and len(h_5y_spy) > 10:
-        spy_5y_ret = (float(h_5y_spy.iloc[-1]) / float(h_5y_spy.iloc[0]) - 1) * 100
-
-    with st.expander("S&P 500 Benchmark (SPY)", expanded=False):
-        m1, m2, m3, m4 = st.columns(4)
-        m1.metric("Market Cap", fmt_mcap(spy_info.get("marketCap")))
-        m2.metric("Beta", "1.00")
-        m3.metric("YTD Return", fmt_pct_sign(spy_ytd_ret) if spy_ytd_ret is not None else "—")
-        m4.metric("5Y Return",  fmt_pct_sign(spy_5y_ret)  if spy_5y_ret  is not None else "—")
-
-    for ticker in active_tickers:
-        info  = infos.get(ticker, {})
-        label = company_label(ticker, info)
-
-        desc = info.get("longBusinessSummary") or info.get("description") or ""
-        sentences = [s.strip() for s in desc.split(". ") if s.strip()]
-        short_desc = ". ".join(sentences[:2]) + ("." if len(sentences) >= 2 else "")
-
-        h_ytd = hist_ytd.get(ticker, pd.Series(dtype=float))
-        ytd_ret = None
-        if not h_ytd.empty:
-            ytd_slice = h_ytd[h_ytd.index >= pd.Timestamp(ytd_start)]
-            if not ytd_slice.empty:
-                ytd_ret = (float(h_ytd.iloc[-1]) / float(ytd_slice.iloc[0]) - 1) * 100
-
-        h_5y = hist_5y.get(ticker, pd.Series(dtype=float))
-        five_yr_ret = None
-        if not h_5y.empty and len(h_5y) > 10:
-            try:
-                five_yr_ret = (float(h_5y.iloc[-1]) / float(h_5y.iloc[0]) - 1) * 100
-            except Exception:
-                five_yr_ret = None
-
-        mktcap = info.get("marketCap")
-        beta   = info.get("beta")
-
-        with st.expander(label, expanded=True):
-            m1, m2, m3, m4 = st.columns(4)
-            m1.metric("Market Cap", fmt_mcap(mktcap))
-            m2.metric("Beta",       fmt_num(beta) if beta else "—")
-            m3.metric("YTD Return", fmt_pct_sign(ytd_ret)    if ytd_ret    is not None else "N/A")
-            m4.metric("5Y Return",  fmt_pct_sign(five_yr_ret) if five_yr_ret is not None else "N/A")
-            if short_desc:
-                st.caption(short_desc)
 
 # ─── Net Worth ────────────────────────────────────────────────────────────────
 
