@@ -472,6 +472,17 @@ def resp_columns(n):
 
 with st.sidebar:
     st.header("Record a Trade")
+
+    # Storage status — tells you whether data persists across redeploys.
+    if _sb() is not None:
+        st.success("Storage: Supabase (persistent)", icon="✅")
+    else:
+        st.warning(
+            "Storage: local CSV (NOT persistent on Streamlit Cloud — "
+            "trades added here are lost when the app redeploys).",
+            icon="⚠️",
+        )
+
     with st.form("add_trade"):
         ticker_input  = st.text_input("Ticker Symbol", placeholder="AAPL")
         trade_type    = st.radio("Trade Type", ["Buy", "Sell"], horizontal=True)
@@ -1025,9 +1036,10 @@ with tab_p:
         st.divider()
         st.subheader("Individual Holdings")
         st.caption(
-            "Return measured against your average cost (same basis as the Holdings tab), "
-            "so each chart's endpoint matches your actual price return on that position. "
-            "Dividends are not included here — see the Holdings tab for total return with dividends."
+            "Each chart shows the stock's price return since the day you first bought it, "
+            "so it starts at 0% on your entry date. This is price-only and uses your first-buy "
+            "date as the baseline, so the endpoint can differ from the Holdings tab, which "
+            "measures return against your average cost and includes dividends."
         )
         n_cols = 1 if IS_MOBILE else 2
         cols = st.columns(n_cols)
@@ -1040,11 +1052,9 @@ with tab_p:
             hist_from = hist[hist.index >= first_buy]
             if hist_from.empty:
                 continue
-            # Baseline = your average cost, not the market price on the first-buy date.
-            # This makes the chart's endpoint equal your actual price return on the
-            # position, matching the Holdings tab (which the first-day-price baseline did not).
-            avg_cost_t = net_positions.get(t, {}).get("avg_cost", 0.0)
-            base = avg_cost_t if avg_cost_t and avg_cost_t > 0 else float(hist_from.iloc[0])
+            # Baseline = market price on your first-buy date, so the series starts at 0%
+            # on the day you entered and moves from there.
+            base = float(hist_from.iloc[0])
             ret_pct_series = (hist_from / base - 1) * 100
             label   = company_label(t, infos.get(t, {}))
             fig_s = go.Figure()
