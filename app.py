@@ -1036,10 +1036,10 @@ with tab_p:
         st.divider()
         st.subheader("Individual Holdings")
         st.caption(
-            "Each chart shows the stock's price return since the day you first bought it, "
-            "so it starts at 0% on your entry date. This is price-only and uses your first-buy "
-            "date as the baseline, so the endpoint can differ from the Holdings tab, which "
-            "measures return against your average cost and includes dividends."
+            "Each chart shows your price return measured against your average purchase cost, "
+            "so the endpoint matches the Holdings tab (price-only, before dividends). Because "
+            "your fill price usually differs from the market close on your buy date, the line "
+            "may not start exactly at 0% — that day-one gap is your entry vs. that day's close."
         )
         n_cols = 1 if IS_MOBILE else 2
         cols = st.columns(n_cols)
@@ -1049,12 +1049,20 @@ with tab_p:
             hist = history.get(t)
             if hist is None or hist.empty:
                 continue
-            hist_from = hist[hist.index >= first_buy]
+            hist_from = hist[hist.index >= first_buy].copy()
             if hist_from.empty:
                 continue
-            # Baseline = market price on your first-buy date, so the series starts at 0%
-            # on the day you entered and moves from there.
-            base = float(hist_from.iloc[0])
+            # Baseline = your average cost (what you actually paid), so the chart's endpoint
+            # equals your real price return and matches the Holdings tab. Also pin the final
+            # point to the same current_price the Holdings tab uses, so the endpoints agree
+            # exactly rather than differing by a stale close.
+            avg_cost_t = net_positions.get(t, {}).get("avg_cost", 0.0)
+            base = avg_cost_t if avg_cost_t and avg_cost_t > 0 else float(hist_from.iloc[0])
+            cur_p = prices.get(t)
+            if cur_p is not None:
+                last_ts = pd.Timestamp(today)
+                hist_from.loc[last_ts] = cur_p
+                hist_from = hist_from.sort_index()
             ret_pct_series = (hist_from / base - 1) * 100
             label   = company_label(t, infos.get(t, {}))
             fig_s = go.Figure()
