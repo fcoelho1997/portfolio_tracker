@@ -1036,10 +1036,11 @@ with tab_p:
         st.divider()
         st.subheader("Individual Holdings")
         st.caption(
-            "Each chart shows your price return measured against your average purchase cost, "
-            "so the endpoint matches the Holdings tab (price-only, before dividends). Because "
-            "your fill price usually differs from the market close on your buy date, the line "
-            "may not start exactly at 0% — that day-one gap is your entry vs. that day's close."
+            "Each chart shows the stock's price return since the day you first bought it, "
+            "starting at 0% on your entry date and evolving from there (price-only). Because "
+            "the baseline is the market close on your buy date rather than your exact fill "
+            "price, the endpoint can differ from the Holdings tab, which measures return "
+            "against your average cost and includes dividends."
         )
         n_cols = 1 if IS_MOBILE else 2
         cols = st.columns(n_cols)
@@ -1052,12 +1053,10 @@ with tab_p:
             hist_from = hist[hist.index >= first_buy].copy()
             if hist_from.empty:
                 continue
-            # Baseline = your average cost (what you actually paid), so the chart's endpoint
-            # equals your real price return and matches the Holdings tab. Also pin the final
-            # point to the same current_price the Holdings tab uses, so the endpoints agree
-            # exactly rather than differing by a stale close.
-            avg_cost_t = net_positions.get(t, {}).get("avg_cost", 0.0)
-            base = avg_cost_t if avg_cost_t and avg_cost_t > 0 else float(hist_from.iloc[0])
+            # Baseline = market close on your first-buy date, so the series starts at 0%
+            # on your entry date and moves from there. Pin the final point to the live
+            # current_price so the line extends to today.
+            base = float(hist_from.iloc[0])
             cur_p = prices.get(t)
             if cur_p is not None:
                 last_ts = pd.Timestamp(today)
