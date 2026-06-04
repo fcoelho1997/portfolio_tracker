@@ -8,6 +8,14 @@ import plotly.graph_objects as go
 import streamlit as st
 import yfinance as yf
 
+# Optional: browser screen-width detection for responsive (mobile) layout.
+# If the package isn't installed, the app falls back to desktop layout.
+try:
+    from streamlit_js_eval import streamlit_js_eval
+    _HAS_JS_EVAL = True
+except Exception:
+    _HAS_JS_EVAL = False
+
 
 def check_password():
     if "authenticated" not in st.session_state:
@@ -280,6 +288,45 @@ def get_dividends(ticker):
         return pd.Series(dtype=float)
 
 
+@st.cache_data(ttl=3600)
+def get_calendar_data(ticker):
+    """Return next earnings date and next ex-dividend date for a ticker, if available."""
+    out = {"earnings_date": None, "ex_div_date": None, "dividend_rate": None}
+    try:
+        tk = yf.Ticker(ticker)
+        # Earnings date via calendar
+        try:
+            cal = tk.calendar
+            if isinstance(cal, dict):
+                ed = cal.get("Earnings Date")
+                if ed:
+                    if isinstance(ed, (list, tuple)) and ed:
+                        out["earnings_date"] = pd.Timestamp(ed[0])
+                    else:
+                        out["earnings_date"] = pd.Timestamp(ed)
+            elif cal is not None and hasattr(cal, "loc"):
+                try:
+                    out["earnings_date"] = pd.Timestamp(cal.loc["Earnings Date"][0])
+                except Exception:
+                    pass
+        except Exception:
+            pass
+
+        info = tk.info or {}
+        # Ex-dividend date
+        exd = info.get("exDividendDate")
+        if exd:
+            try:
+                out["ex_div_date"] = pd.Timestamp(exd, unit="s") if isinstance(exd, (int, float)) else pd.Timestamp(exd)
+            except Exception:
+                pass
+        # Forward dividend rate (annual $)
+        out["dividend_rate"] = info.get("dividendRate")
+    except Exception:
+        pass
+    return out
+
+
 def period_return(history_series, period_days):
     """Total price return over the last `period_days`. Returns % (e.g. 12.5 = +12.5%)."""
     if history_series is None or history_series.empty:
@@ -294,10 +341,134 @@ def period_return(history_series, period_days):
         return None
 
 
+# ── Fama-French factor analysis ───────────────────────────────────────────────
+# US factors only, sourced free from Ken French's data library (Dartmouth).
+# Caveat: these are US factors. VINP and NU are Brazil-driven, so their factor
+# loadings on US HML/SMB will be unreliable and mostly land in the residual.
+
+FF_URL = (
+    "https://mba.tuck.dartmouth.edu/pages/faculty/ken.french/"
+    "ftp/F-F_Research_Data_Factors_CSV.zip"
+)
+
+
+@st.cache_data(ttl=60 * 60 * 24)
+def get_ff_factors():
+    """Download monthly Fama-French 3-factor data. Returns a DataFrame indexed by
+    month-end Timestamp with columns Mkt-RF, SMB, HML, RF (in decimal, not %)."""
+    import io
+    import zipfile
+    import urllib.request
+
+    try:
+        req = urllib.request.Request(FF_URL, headers={"User-Agent": "Mozilla/5.0"})
+        with urllib.request.urlopen(req, timeout=30) as resp:
+            raw = resp.read()
+        zf = zipfile.ZipFile(io.BytesIO(raw))
+        csv_name = zf.namelist()[0]
+        text = zf.read(csv_name).decode("latin-1")
+
+        # The monthly block runs until the first blank line / annual section.
+        lines = text.splitlines()
+        start = None
+        for i, ln in enumerate(lines):
+            cells = ln.split(",")
+            if cells[0].strip().isdigit() and len(cells[0].strip()) == 6:
+                start = i
+                break
+        if start is None:
+            return pd.DataFrame()
+        rows = []
+        for ln in lines[start:]:
+            cells = [c.strip() for c in ln.split(",")]
+            if not cells[0].isdigit() or len(cells[0]) != 6:
+                break
+            try:
+                ym = cells[0]
+                mkt, smb, hml, rf = (float(cells[1]), float(cells[2]),
+                                     float(cells[3]), float(cells[4]))
+                rows.append((ym, mkt, smb, hml, rf))
+            except Exception:
+                break
+        if not rows:
+            return pd.DataFrame()
+        df = pd.DataFrame(rows, columns=["ym", "Mkt-RF", "SMB", "HML", "RF"])
+        df["date"] = pd.to_datetime(df["ym"], format="%Y%m") + pd.offsets.MonthEnd(0)
+        df = df.set_index("date")[["Mkt-RF", "SMB", "HML", "RF"]] / 100.0
+        return df
+    except Exception:
+        return pd.DataFrame()
+
+
+def monthly_returns_from_prices(price_series):
+    """Convert a daily price Series into monthly (month-end) simple returns."""
+    if price_series is None or price_series.empty:
+        return pd.Series(dtype=float)
+    monthly = price_series.resample("ME").last()
+    return monthly.pct_change().dropna()
+
+
+def run_ff_regression(excess_ret, factors):
+    """OLS of excess returns on Mkt-RF, SMB, HML using numpy. Returns dict or None."""
+    df = pd.concat([excess_ret.rename("y"), factors[["Mkt-RF", "SMB", "HML"]]], axis=1).dropna()
+    if len(df) < 12:
+        return None
+    y = df["y"].values
+    X = df[["Mkt-RF", "SMB", "HML"]].values
+    X = np.column_stack([np.ones(len(X)), X])  # add intercept
+    try:
+        beta, _, _, _ = np.linalg.lstsq(X, y, rcond=None)
+        resid = y - X @ beta
+        n, k = X.shape
+        dof = n - k
+        sigma2 = (resid @ resid) / dof if dof > 0 else np.nan
+        cov = sigma2 * np.linalg.inv(X.T @ X)
+        se = np.sqrt(np.diag(cov))
+        tstats = beta / se
+        ss_tot = ((y - y.mean()) ** 2).sum()
+        ss_res = (resid ** 2).sum()
+        r2 = 1 - ss_res / ss_tot if ss_tot > 0 else np.nan
+        return {
+            "n": n,
+            "alpha_monthly": beta[0],
+            "alpha_annual": beta[0] * 12,
+            "alpha_t": tstats[0],
+            "mkt": beta[1], "mkt_t": tstats[1],
+            "smb": beta[2], "smb_t": tstats[2],
+            "hml": beta[3], "hml_t": tstats[3],
+            "r2": r2,
+        }
+    except Exception:
+        return None
+
+
 # ── App ───────────────────────────────────────────────────────────────────────
 
 st.set_page_config(page_title="Portfolio Tracker", page_icon="📈", layout="wide")
 st.title("Stock Portfolio Tracker")
+
+# ── Responsive layout detection ───────────────────────────────────────────────
+# Detect the browser viewport width once and cache it in session state.
+# Phones (< 768px) get a single-column, stacked layout; desktop keeps side-by-side.
+if "is_mobile" not in st.session_state:
+    st.session_state.is_mobile = False
+
+if _HAS_JS_EVAL:
+    try:
+        _w = streamlit_js_eval(js_expressions="window.innerWidth", key="screen_width")
+        if _w is not None:
+            st.session_state.is_mobile = float(_w) < 768
+    except Exception:
+        pass
+
+IS_MOBILE = st.session_state.is_mobile
+
+
+def resp_columns(n):
+    """Return n columns on desktop, or n stacked single-column containers on mobile."""
+    if IS_MOBILE:
+        return [st.container() for _ in range(n)]
+    return st.columns(n)
 
 with st.sidebar:
     st.header("Record a Trade")
@@ -595,9 +766,9 @@ alpha_feb_port, alpha_feb_spy, alpha_feb = compute_alpha_for_period(
 
 # ── Tabs ──────────────────────────────────────────────────────────────────────
 
-tab_h, tab_p, tab_a, tab_pnl, tab_nw, tab_alpha = st.tabs([
+tab_h, tab_p, tab_a, tab_pnl, tab_nw, tab_alpha, tab_cal = st.tabs([
     "Holdings", "Performance", "Allocation",
-    "P&L & Dividends", "Net Worth", "Alpha",
+    "P&L & Dividends", "Net Worth", "Alpha", "Earnings & Dividends Calendar",
 ])
 
 # ─── Holdings ────────────────────────────────────────────────────────────────
@@ -623,6 +794,10 @@ with tab_h:
                 "Avg Hold (days)": int(hr["holding_days"]),
             })
         st.dataframe(pd.DataFrame(grouped_rows), use_container_width=True, hide_index=True)
+        st.caption(
+            "\"Return (w/ div)\" is your total return on this position vs. your average cost, "
+            "including dividends received: (current value − cost basis + dividends) ÷ cost basis."
+        )
 
         tc      = holdings_df["cost_basis"].sum()
         tv      = holdings_df["current_value"].sum() if holdings_df["current_value"].notna().any() else 0.0
@@ -668,6 +843,10 @@ with tab_h:
                 "5Y Return":   fmt_pct_sign(hr["ret_5y"]),
             })
         st.dataframe(pd.DataFrame(risk_rows), use_container_width=True, hide_index=True)
+        st.caption(
+            "1Y and 5Y are the stock's trailing market price returns (last 12 / 60 months), "
+            "not your return since purchase. They describe the asset, not your position."
+        )
 
         # Whole-portfolio summary
         st.markdown("**Whole Portfolio (weighted by current value)**")
@@ -681,6 +860,86 @@ with tab_h:
             "Betas are 5Y monthly figures sourced from stockanalysis.com / macroaxis.com (May 2026). "
             "1Y and 5Y returns are price returns from yfinance."
         )
+
+        # ─── Fama-French 3-Factor Analysis ────────────────────────────────────
+        st.divider()
+        st.subheader("Fama-French 3-Factor Analysis (US factors)")
+        st.caption(
+            "Decomposes returns into market (Mkt-RF), size (SMB), and value (HML) factors "
+            "using monthly data from Ken French's library. US factors only — VINP and NU are "
+            "Brazil-driven, so their SMB/HML loadings are unreliable and largely fall into the "
+            "residual. Read the US holdings (VOO, DIA, BRK-B, MSA, DUK) with more confidence."
+        )
+
+        ff = get_ff_factors()
+        if ff.empty:
+            st.warning(
+                "Could not download Fama-French factor data right now. "
+                "It may be a temporary network issue with the Dartmouth server — try refreshing later."
+            )
+        else:
+            # Build a long monthly price history (5y) per holding and for the portfolio.
+            ff_rows = []
+            port_monthly_excess = None
+            port_weights_sum = 0.0
+
+            for _, hr in holdings_df.iterrows():
+                tkr = hr["ticker"]
+                h5 = hist_5y.get(tkr, pd.Series(dtype=float))
+                m_ret = monthly_returns_from_prices(h5)
+                if m_ret.empty:
+                    continue
+                # align to factor RF
+                joined = pd.concat([m_ret.rename("r"), ff["RF"]], axis=1).dropna()
+                if joined.empty:
+                    continue
+                excess = joined["r"] - joined["RF"]
+                res = run_ff_regression(excess, ff)
+                if res is None:
+                    continue
+                ff_rows.append({
+                    "Company":   hr["company"],
+                    "Mkt-RF (β)": f"{res['mkt']:.2f}",
+                    "SMB":       f"{res['smb']:+.2f}",
+                    "HML":       f"{res['hml']:+.2f}",
+                    "Alpha (ann.)": fmt_pct_sign(res["alpha_annual"] * 100),
+                    "R²":        f"{res['r2']*100:.0f}%",
+                    "Months":    res["n"],
+                })
+
+                # accumulate value-weighted portfolio excess return
+                if total_port_val > 0 and pd.notna(hr["current_value"]):
+                    w = hr["current_value"] / total_port_val
+                    contrib = excess * w
+                    if port_monthly_excess is None:
+                        port_monthly_excess = contrib
+                    else:
+                        port_monthly_excess = port_monthly_excess.add(contrib, fill_value=0)
+                    port_weights_sum += w
+
+            if ff_rows:
+                st.dataframe(pd.DataFrame(ff_rows), use_container_width=True, hide_index=True)
+
+            # Portfolio-level factor regression
+            if port_monthly_excess is not None and port_weights_sum > 0:
+                port_res = run_ff_regression(port_monthly_excess, ff)
+                if port_res is not None:
+                    st.markdown("**Whole Portfolio (value-weighted)**")
+                    f1, f2, f3, f4 = resp_columns(4)
+                    f1.metric("Market (Mkt-RF)", f"{port_res['mkt']:.2f}",
+                              help="Exposure to the overall US equity market.")
+                    f2.metric("Size (SMB)", f"{port_res['smb']:+.2f}",
+                              help="Positive = small-cap tilt; negative = large-cap tilt.")
+                    f3.metric("Value (HML)", f"{port_res['hml']:+.2f}",
+                              help="Positive = value tilt; negative = growth tilt.")
+                    f4.metric("Annual Alpha", fmt_pct_sign(port_res["alpha_annual"] * 100),
+                              help=f"Intercept, annualized. t-stat {port_res['alpha_t']:.2f}, "
+                                   f"R² {port_res['r2']*100:.0f}%, {port_res['n']} months.")
+                    st.caption(
+                        f"Portfolio factor regression over {port_res['n']} months. "
+                        "An alpha t-stat above ~2 in absolute value would be statistically significant; "
+                        "with this few months, treat the magnitude as indicative, not conclusive."
+                    )
 
     with st.expander("View / delete individual trades"):
         ind_rows = []
@@ -765,7 +1024,13 @@ with tab_p:
 
         st.divider()
         st.subheader("Individual Holdings")
-        cols = st.columns(2)
+        st.caption(
+            "Return measured against your average cost (same basis as the Holdings tab), "
+            "so each chart's endpoint matches your actual price return on that position. "
+            "Dividends are not included here — see the Holdings tab for total return with dividends."
+        )
+        n_cols = 1 if IS_MOBILE else 2
+        cols = st.columns(n_cols)
         for i, t in enumerate(active_tickers):
             ticker_trades = portfolio[portfolio["ticker"] == t]
             first_buy = pd.Timestamp(ticker_trades[ticker_trades["quantity"] > 0]["date"].min())
@@ -775,7 +1040,11 @@ with tab_p:
             hist_from = hist[hist.index >= first_buy]
             if hist_from.empty:
                 continue
-            base    = float(hist_from.iloc[0])
+            # Baseline = your average cost, not the market price on the first-buy date.
+            # This makes the chart's endpoint equal your actual price return on the
+            # position, matching the Holdings tab (which the first-day-price baseline did not).
+            avg_cost_t = net_positions.get(t, {}).get("avg_cost", 0.0)
+            base = avg_cost_t if avg_cost_t and avg_cost_t > 0 else float(hist_from.iloc[0])
             ret_pct_series = (hist_from / base - 1) * 100
             label   = company_label(t, infos.get(t, {}))
             fig_s = go.Figure()
@@ -788,7 +1057,7 @@ with tab_p:
             fig_s.update_layout(title=label, xaxis_title="", yaxis_title="Return (%)",
                                  height=280, margin=dict(t=40, b=20),
                                  showlegend=False)
-            with cols[i % 2]:
+            with cols[i % n_cols]:
                 st.plotly_chart(fig_s, use_container_width=True)
 
         # Drawdown chart moved to bottom of Performance tab
@@ -832,7 +1101,7 @@ with tab_a:
 
         # ─── Per-ticker pies ──────────────────────────────────────────────────
         st.subheader("By Holding")
-        col1, col2 = st.columns(2)
+        col1, col2 = resp_columns(2)
         with col1:
             fig_pie1 = px.pie(alloc_df, values="current_value", names="ticker",
                               title="By Current Value")
@@ -867,7 +1136,7 @@ with tab_a:
         sector_agg["val_weight"]  = sector_agg["current_value"] / total_val  * 100 if total_val  > 0 else 0
         sector_agg["cost_weight"] = sector_agg["cost_basis"]    / total_cost * 100 if total_cost > 0 else 0
 
-        col_s1, col_s2 = st.columns(2)
+        col_s1, col_s2 = resp_columns(2)
         with col_s1:
             fig_sec1 = px.pie(sector_agg, values="current_value", names="sector",
                               title="By Current Value")
@@ -903,7 +1172,7 @@ with tab_a:
         geo_agg["val_weight"]  = geo_agg["current_value"] / total_val  * 100 if total_val  > 0 else 0
         geo_agg["cost_weight"] = geo_agg["cost_basis"]    / total_cost * 100 if total_cost > 0 else 0
 
-        col_g1, col_g2 = st.columns(2)
+        col_g1, col_g2 = resp_columns(2)
         with col_g1:
             fig_geo1 = px.pie(geo_agg, values="current_value", names="geography",
                               title="By Current Value",
@@ -1062,7 +1331,7 @@ with tab_alpha:
     alpha_df = pd.DataFrame(alpha_data)
     st.dataframe(alpha_df, use_container_width=True, hide_index=True)
 
-    col1, col2 = st.columns(2)
+    col1, col2 = resp_columns(2)
     with col1:
         st.subheader("Since Inception")
         if alpha_inception is not None:
@@ -1103,3 +1372,78 @@ with tab_alpha:
             hovermode="x unified",
         )
         st.plotly_chart(fig_alpha, use_container_width=True)
+
+# ─── Earnings & Dividends Calendar ────────────────────────────────────────────
+
+with tab_cal:
+    st.subheader("Upcoming Earnings & Dividend Dates")
+    st.caption(
+        "Next scheduled earnings announcement and ex-dividend date for each active holding, "
+        "from yfinance. Dates can shift; treat these as best-available estimates, especially "
+        "for non-US listings. ETFs (VOO, DIA) do not report earnings."
+    )
+
+    cal_data = {t: get_calendar_data(t) for t in active_tickers}
+    today_ts = pd.Timestamp(today)
+
+    cal_rows = []
+    for t in active_tickers:
+        cd = cal_data.get(t, {})
+        ed = cd.get("earnings_date")
+        xd = cd.get("ex_div_date")
+
+        def _fmt_date(d):
+            if d is None or pd.isna(d):
+                return "—"
+            try:
+                return pd.Timestamp(d).strftime("%Y-%m-%d")
+            except Exception:
+                return "—"
+
+        def _days_until(d):
+            if d is None or pd.isna(d):
+                return None
+            try:
+                return (pd.Timestamp(d).normalize() - today_ts.normalize()).days
+            except Exception:
+                return None
+
+        ed_days = _days_until(ed)
+        xd_days = _days_until(xd)
+
+        cal_rows.append({
+            "Company":        company_label(t, infos.get(t, {})),
+            "Next Earnings":  _fmt_date(ed),
+            "Earnings In":    (f"{ed_days}d" if (ed_days is not None and ed_days >= 0) else
+                               ("past" if ed_days is not None else "—")),
+            "Ex-Dividend":    _fmt_date(xd),
+            "Ex-Div In":      (f"{xd_days}d" if (xd_days is not None and xd_days >= 0) else
+                               ("past" if xd_days is not None else "—")),
+            "Annual Div ($)": fmt_usd(cd.get("dividend_rate")) if cd.get("dividend_rate") else "—",
+        })
+
+    st.dataframe(pd.DataFrame(cal_rows), use_container_width=True, hide_index=True)
+
+    # Highlight what's coming up in the next 30 days
+    st.divider()
+    st.subheader("Next 30 Days")
+    upcoming = []
+    for t in active_tickers:
+        cd = cal_data.get(t, {})
+        label = company_label(t, infos.get(t, {}))
+        for kind, d in [("Earnings", cd.get("earnings_date")), ("Ex-Dividend", cd.get("ex_div_date"))]:
+            if d is None or pd.isna(d):
+                continue
+            try:
+                dd = (pd.Timestamp(d).normalize() - today_ts.normalize()).days
+            except Exception:
+                continue
+            if 0 <= dd <= 30:
+                upcoming.append({"Date": pd.Timestamp(d).strftime("%Y-%m-%d"),
+                                 "In": f"{dd}d", "Event": kind, "Company": label,
+                                 "_sort": dd})
+    if upcoming:
+        up_df = pd.DataFrame(upcoming).sort_values("_sort").drop(columns="_sort")
+        st.dataframe(up_df, use_container_width=True, hide_index=True)
+    else:
+        st.info("Nothing scheduled in the next 30 days (based on available data).")
