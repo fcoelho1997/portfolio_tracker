@@ -162,12 +162,22 @@ def _sb():
 def load_portfolio():
     client = _sb()
     if client:
-        result = client.table("trades").select("*").order("date").execute()
-        if result.data:
-            df = pd.DataFrame(result.data)
-            df["date"] = pd.to_datetime(df["date"]).dt.tz_localize(None)
-            return df[["id", "ticker", "date", "quantity", "price_paid"]]
-        return pd.DataFrame(columns=["id", "ticker", "date", "quantity", "price_paid"])
+        try:
+            result = client.table("trades").select("*").order("date").execute()
+            if result.data:
+                df = pd.DataFrame(result.data)
+                df["date"] = pd.to_datetime(df["date"]).dt.tz_localize(None)
+                return df[["id", "ticker", "date", "quantity", "price_paid"]]
+            return pd.DataFrame(columns=["id", "ticker", "date", "quantity", "price_paid"])
+        except Exception as e:
+            # Supabase is configured but unreachable (paused project, bad URL, network).
+            # Warn and fall through to the CSV instead of crashing the whole app.
+            st.warning(
+                "Could not reach Supabase, so showing data from the local CSV instead. "
+                "Check that your Supabase project is active (not paused) and that "
+                "SUPABASE_URL is correct.",
+                icon="⚠️",
+            )
     if os.path.exists(PORTFOLIO_FILE):
         df = pd.read_csv(PORTFOLIO_FILE, parse_dates=["date"])
         df["date"] = pd.to_datetime(df["date"]).dt.tz_localize(None)
