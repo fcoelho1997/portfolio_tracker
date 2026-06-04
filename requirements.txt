@@ -5,12 +5,4 @@ plotly>=5.18.0
 pandas_datareader>=0.10.0
 numpy>=1.24.0
 supabase>=2.0.0
-
-# ADD this one line to your existing requirements.txt (do not delete your current entries):
- 
 streamlit-js-eval
- 
-# Your existing requirements.txt already has streamlit, pandas, numpy, plotly,
-# yfinance (and supabase if you use it). Those stay as-is.
-# No other new dependencies are needed — the Fama-French regression uses numpy,
-# and the factor data is downloaded with Python's built-in urllib/zipfile.
